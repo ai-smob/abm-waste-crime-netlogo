@@ -15,7 +15,11 @@ assumptions, not estimates of reality.
 | --- | --- |
 | `PROJECT_LOG.md` | Everything done in the project, in order, with reasons, basis and effect. Updated with every change. |
 | `prompts/` | Every instruction given to the AI, in Swedish and English, and how the prompts were produced |
-| `netlogo/` | The NetLogo port of the model. Not started yet. |
+| `netlogo/waste_crime.nlogox` | The NetLogo 7 port of the model, one file, with BehaviorSpace experiments. See `netlogo/README.md`. |
+| `netlogo/data/` | Parameters and scenarios as CSV, generated from the Python project's configuration |
+| `reference/` | The Python model's 240 reference runs (8 scenarios x 30 seeds) and the comparison report |
+| `tools/` | `compare.py` (statistical comparison of the two implementations) and `run_regression.sh` |
+| `.github/workflows/` | Runs the NetLogo model headless and compares it with Python on every push |
 
 ## What is not here
 
@@ -37,17 +41,24 @@ seeds. Every parameter value is labelled by origin: source, derived, placeholder
 or open question. Five values rest on Swedish data; the rest are placeholders awaiting the
 group's answers.
 
-## Plan
+## Status
 
-1. Port the model (agents, decision, monthly steps, inspection, justice chain, learning, firm
-   switching, scenarios, metrics) to NetLogo so that the group's ABM expert can read the code.
-2. Share the parameters and scenarios between the Python and NetLogo implementations, so
-   that no value is typed twice by hand.
-3. Regression-test the two against each other: statistical agreement of every metric over
-   repeated runs, deterministic checks where randomness can be removed, and an AI review of
-   divergences against the written specification.
-4. Translate the Python solution to English and, in the longer run, generalise the
-   infrastructure so that other ABMs can be built on it.
+1. **Port: done (2026-10-22).** The model (agents, decision, monthly steps, inspection,
+   justice chain, learning, firm switching, scenarios, metrics) runs in NetLogo 7.0.4.
+2. **Shared data: done.** Parameters and scenarios are exported from the Python project's
+   YAML to CSV; a test in the Python project fails if the CSV is stale.
+3. **Regression test: done.** `tools/compare.py` compares the distributions of 27 metrics
+   per scenario and the intervention effects between the two implementations. The report
+   is in `reference/`. Exact equality is impossible (different random number generators),
+   so agreement is statistical.
+4. Next: review by the research group's ABM expert; translation of the Python solution to
+   English; in the longer run a general ABM infrastructure.
+
+## Rule for changes
+
+A change to the model is made in the specification first (the model notes), then in both
+implementations, then the regression test must pass. A changed parameter value is made in
+the Python project's `config/`, exported, and committed here.
 
 ## Licence
 

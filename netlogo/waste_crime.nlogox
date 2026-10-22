@@ -1,0 +1,1220 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.4" snapToGrid="true">
+  <code><![CDATA[;; =============================================================================
+;; Agent-based model of organised waste crime in Sweden: NetLogo port
+;; =============================================================================
+;; A port of the Python prototype (version 0.2). Every procedure mirrors a step
+;; in the Python model's monthly loop, in the same order, so that the two can be
+;; compared. All parameter values are read from data/parameters.csv, which is
+;; generated from the Python project's config/parametrar.yaml; nothing is typed
+;; here. Scenarios come from data/scenarios.csv in the same way.
+;;
+;; One tick is one month. A run is simulation.months ticks. The chosen scenario's
+;; changes are switched on in month simulation.intervention_start_month.
+;;
+;; The model is a technical prototype: not calibrated, not validated. Results are
+;; outcomes under stated assumptions, not estimates of reality.
+;; =============================================================================
+
+extensions [csv table rnd]
+
+globals [
+  P                      ; table: parameter key -> value (dotted keys, see data/parameters.csv)
+  all-scenarios          ; table: scenario name -> list of [key value]
+  scenario-changes       ; the changes of the chosen scenario
+  controller-type-names  ; list of strings, e.g. ["ordinary" "prior_record" "oc_linked"]
+  waste-type-names       ; list of strings
+  pathway-names          ; list of strings, e.g. ["dumping" "misclassification"]
+  n-months               ; simulation.months
+  intervention-month     ; simulation.intervention_start_month
+  month                  ; current month, 1-based (equals ticks)
+
+  pending                ; firms due to start: list of [due-month controller-or-nobody municipality former-customers]
+  reports                ; reports waiting in the justice chain: list of [due-month company]
+  month-batches          ; illegal batches created this month (list)
+  market-recent          ; last 12 months of [tonnes illegal-tonnes] for the whole market
+  counters                      ; table: this month's counters
+  totals                 ; table: counters summed over the measurement period (month >= intervention-month)
+  series-illegal-share   ; list: illegal share per month, for time-series comparison
+  end-perceived          ; list: mean perceived detection per pathway at the end
+]
+
+breed [producers producer]       ; waste producers: generate waste, pay a firm
+breed [companies company]        ; waste firms: paid to take the waste
+breed [controllers controller]   ; the people who actually control the firms
+breed [regulators regulator]     ; one supervisory authority per municipality
+breed [batches batch]            ; illegal consignments, the model's hidden ground truth
+
+producers-own [
+  waste-type              ; string
+  tonnes-per-month
+  my-company              ; a company or nobody
+  handling                ; "" = no decision yet, "legal", or a pathway name
+]
+
+controllers-own [
+  ctype                   ; "ordinary" / "prior_record" / "oc_linked"
+  propensity
+  can-switch?             ; can obtain a new firm through a company broker
+  perceived-detection     ; list aligned with pathway-names
+  active-c?
+  company-list            ; all firms ever controlled, closed ones included
+  visible-detections      ; findings the authorities can tie to the person
+  illegal-tonnes-c
+  used-pathways           ; this month's working memory (lists of names)
+  detected-pathways
+]
+
+companies-own [
+  municipality
+  my-controller
+  frontman?               ; the formal representative is a front man
+  founded-month
+  active?
+  closed-month
+  close-reason            ; "prohibition" / "switched" / ""
+  detections
+  revenue
+  costs
+  fines
+  tonnes-co
+  illegal-tonnes-co
+  open-batches            ; list of batches an inspection can still find
+  recent                  ; last 12 months of [tonnes illegal-tonnes]
+]
+
+regulators-own [
+  r-municipality
+  capacity-factor
+  budget                  ; saved-up inspections (fractions carry over)
+  known-detections        ; table: company who -> count
+  complaints              ; table: company who -> count
+]
+
+batches-own [
+  b-month
+  b-company
+  b-controller
+  pathway
+  b-waste-type
+  b-tonnes
+  avoided-cost
+  detected?
+  detected-month
+  detected-by             ; "supervision" / "road_check" / ""
+]
+
+;; -----------------------------------------------------------------------------
+;; Parameters and scenarios (shared with the Python model through CSV files)
+;; -----------------------------------------------------------------------------
+
+to load-data
+  set P table:make
+  foreach but-first csv:from-file "data/parameters.csv" [ row ->
+    table:put P (item 0 row) (parse-value (item 1 row) (item 2 row))
+  ]
+  set all-scenarios table:make
+  foreach but-first csv:from-file "data/scenarios.csv" [ row ->
+    let name item 0 row
+    if not table:has-key? all-scenarios name [ table:put all-scenarios name [] ]
+    if item 1 row != "" [
+      table:put all-scenarios name (lput (list (item 1 row) (parse-value (item 2 row) (item 3 row)))
+                                         (table:get all-scenarios name))
+    ]
+  ]
+  set controller-type-names split-names (param "_lists.controller_types")
+  set waste-type-names split-names (param "_lists.waste_types")
+  set pathway-names split-names (param "_lists.pathways")
+  set n-months param "simulation.months"
+  set intervention-month param "simulation.intervention_start_month"
+end
+
+to-report parse-value [kind text]
+  ;; The CSV extension already turns numeric cells into numbers.
+  if kind = "number" [ report ifelse-value (is-number? text) [text] [read-from-string text] ]
+  if kind = "boolean" [ report (text = "true" or text = true) ]
+  report (word text)
+end
+
+to-report split-names [text]
+  ;; "a;b;c" -> ["a" "b" "c"]
+  let names []
+  let current ""
+  foreach (range length text) [ i ->
+    let ch substring text i (i + 1)
+    ifelse ch = ";" [ set names lput current names  set current "" ] [ set current (word current ch) ]
+  ]
+  report lput current names
+end
+
+to-report param [key]
+  if not table:has-key? P key [ error (word "Unknown parameter: " key) ]
+  report table:get P key
+end
+
+to-report ctype-param [name key]
+  report param (word "population.controller_types." name "." key)
+end
+
+to-report pathway-param [name key]
+  report param (word "pathways." name "." key)
+end
+
+to-report waste-type-param [name key]
+  report param (word "waste.types." name "." key)
+end
+
+to-report scenario-names
+  report table:keys all-scenarios
+end
+
+;; -----------------------------------------------------------------------------
+;; Setup
+;; -----------------------------------------------------------------------------
+
+to setup
+  clear-all
+  random-seed run-seed
+  load-data
+  if not table:has-key? all-scenarios scenario-name [
+    error (word "Unknown scenario: " scenario-name " (available: " scenario-names ")")
+  ]
+  set scenario-changes table:get all-scenarios scenario-name
+  set month 0
+  set pending []
+  set reports []
+  set month-batches []
+  set market-recent []
+  set counters table:make
+  set totals table:make
+  set series-illegal-share []
+  set end-perceived []
+  create-population
+  reset-ticks
+end
+
+to create-population
+  let low param "supervision.capacity_variation.0"
+  let high param "supervision.capacity_variation.1"
+  foreach (range param "population.n_municipalities") [ m ->
+    create-regulators 1 [
+      hide-turtle
+      set r-municipality m
+      set capacity-factor low + random-float (high - low)
+      set budget 0
+      set known-detections table:make
+      set complaints table:make
+    ]
+  ]
+  repeat param "population.n_companies" [
+    let ctrl new-controller
+    let created new-company ctrl (random param "population.n_municipalities")
+  ]
+  let sigma param "waste.tonnes_spread_sigma"
+  let mu (ln param "waste.tonnes_per_producer_month_mean") - (sigma ^ 2) / 2
+  repeat param "population.n_producers" [
+    create-producers 1 [
+      hide-turtle
+      set waste-type rnd:weighted-one-of-list waste-type-names [ n -> waste-type-param n "share" ]
+      set tonnes-per-month exp (mu + random-normal 0 sigma)
+      set my-company nobody
+      set handling ""
+    ]
+  ]
+end
+
+to-report new-controller
+  let result nobody
+  create-controllers 1 [
+    hide-turtle
+    set ctype rnd:weighted-one-of-list controller-type-names [ n -> ctype-param n "share" ]
+    set propensity random-normal (ctype-param ctype "propensity_mean") (ctype-param ctype "propensity_sd")
+    set can-switch? ctype-param ctype "can_switch_company"
+    set perceived-detection map [ n -> pathway-param n "initial_perceived_detection" ] pathway-names
+    set active-c? true
+    set company-list []
+    set visible-detections 0
+    set illegal-tonnes-c 0
+    set used-pathways []
+    set detected-pathways []
+    set result self
+  ]
+  report result
+end
+
+to-report new-company [ctrl m]
+  let result nobody
+  let frontman-p ctype-param ([ctype] of ctrl) "frontman_probability"
+  create-companies 1 [
+    hide-turtle
+    set municipality m
+    set my-controller ctrl
+    set frontman? (random-float 1 < frontman-p)
+    set founded-month month
+    set active? true
+    set closed-month -1
+    set close-reason ""
+    set detections 0
+    set revenue 0
+    set costs 0
+    set fines 0
+    set tonnes-co 0
+    set illegal-tonnes-co 0
+    set open-batches []
+    set recent []
+    set result self
+  ]
+  ask ctrl [ set company-list lput result company-list ]
+  report result
+end
+
+;; -----------------------------------------------------------------------------
+;; The monthly loop, in the same order as the Python model's step()
+;; -----------------------------------------------------------------------------
+
+to go
+  if month >= n-months [ stop ]
+  set month month + 1
+  if month = intervention-month [
+    foreach scenario-changes [ ch -> table:put P (item 0 ch) (item 1 ch) ]
+  ]
+  set counters table:make
+  start-companies      ; 1. new firms and new entrants
+  customers-choose     ; 2. producers choose a waste firm
+  handle-waste         ; 3. waste arises, decisions are made, waste is handled
+  road-checks          ; 4. roadside checks of transports
+  public-reports       ; 5. the public discovers and reports dumping
+  supervise            ; 6. supervisory authorities inspect firms
+  legal-chain          ; 7. reports are decided, fines imposed
+  learn                ; 8. decision-makers update their perceived risk
+  record-month         ; 9. the month's outcomes are saved
+  tick
+end
+
+to run-to-end
+  while [month < n-months] [ go ]
+end
+
+to count-up [key amount]
+  table:put counters key ((table:get-or-default counters key 0) + amount)
+end
+
+;; 1. New firms --------------------------------------------------------------
+
+to start-companies
+  let due filter [ s -> item 0 s <= month ] pending
+  set pending filter [ s -> item 0 s > month ] pending
+  let n-munis param "population.n_municipalities"
+  let retention param "adaptation.customer_retention_on_switch"
+  foreach due [ s ->
+    let ctrl item 1 s
+    let m 0
+    ifelse ctrl = nobody [
+      ;; New entrant: a new actor takes the vacant place in the same municipality.
+      set ctrl new-controller
+      set m item 2 s
+      count-up "new_entrants" 1
+    ] [
+      ;; Firm switch: same decision-maker, new firm in another municipality.
+      let others filter [ x -> x != item 2 s ] (range n-munis)
+      set m ifelse-value (empty? others) [0] [one-of others]
+      count-up "restarts" 1
+    ]
+    let comp new-company ctrl m
+    foreach item 3 s [ prod ->
+      if random-float 1 < retention [
+        ask prod [ set my-company comp  set handling "" ]
+      ]
+    ]
+  ]
+end
+
+;; 2. Customers choose a firm ------------------------------------------------
+
+to customers-choose
+  let loyalty param "market.customer_loyalty"
+  ;; Price pressure (version 0.2): firms that handled waste illegally charge less
+  ;; and attract more customers. With pull = 0 customers choose at random.
+  let pull (param "market.price_sensitivity") * (param "market.price_discount")
+  let active-set companies with [active?]
+  ask producers [
+    let stay (random-float 1 < loyalty)
+    let keep? false
+    if my-company != nobody [ if [active?] of my-company [ set keep? stay ] ]
+    if not keep? [
+      ifelse pull > 0 [
+        set my-company rnd:weighted-one-of active-set [ exp (pull * recent-illegal-share) ]
+      ] [
+        set my-company one-of active-set
+      ]
+      set handling ""        ; new customer relation: new decision on the handling
+    ]
+  ]
+end
+
+to-report recent-illegal-share
+  ;; company context: share of the last 12 months' tonnes handled illegally
+  let total sum map [ r -> item 0 r ] recent
+  report ifelse-value (total > 0) [ (sum map [ r -> item 1 r ] recent) / total ] [0]
+end
+
+to-report market-illegal-share
+  let total sum map [ r -> item 0 r ] market-recent
+  report ifelse-value (total > 0) [ (sum map [ r -> item 1 r ] market-recent) / total ] [0]
+end
+
+;; 3. Waste arises, decisions are made, waste is handled ---------------------
+
+to handle-waste
+  let margin param "waste.price_margin"
+  let discount param "market.price_discount"
+  let reconsider-p param "decision.reconsider_probability_per_month"
+  let pressure market-illegal-share
+  set month-batches []
+  let month-tonnes table:make
+  let month-illegal table:make
+
+  ask producers [
+    let comp my-company
+    let ctrl [my-controller] of comp
+    let tonnes tonnes-per-month
+    let legal-cost tonnes * (waste-type-param waste-type "legal_cost_per_tonne")
+
+    ;; The decision is made when the customer relation is new, after a finding,
+    ;; and now and then. In between the arrangement stays as it is.
+    if handling = "" or random-float 1 < reconsider-p [
+      ;; U = reward + propensity - effort - risk for each illegal option
+      let utilities map [ name -> pathway-utility name ctrl legal-cost pressure ] pathway-names
+      set handling pick-choice (choice-probabilities utilities)
+      count-up "decisions" 1
+    ]
+    let choice handling
+
+    ;; Bookkeeping
+    let illegal-share-of-comp [recent-illegal-share] of comp
+    ask comp [
+      set revenue revenue + legal-cost * (1 + margin) * (1 - discount * illegal-share-of-comp)
+      set tonnes-co tonnes-co + tonnes
+    ]
+    table:put month-tonnes [who] of comp ((table:get-or-default month-tonnes [who] of comp 0) + tonnes)
+    count-up "tonnes" tonnes
+    count-up (word "tonnes_type_" waste-type) tonnes
+    count-up (word "tonnes_ctype_" [ctype] of ctrl) tonnes
+    ifelse choice = "legal" [
+      ask comp [ set costs costs + legal-cost ]
+    ] [
+      let cost (pathway-param choice "cost_share") * legal-cost
+      let prod self
+      let new-batch nobody
+      hatch-batches 1 [
+        hide-turtle
+        set b-month month
+        set b-company comp
+        set b-controller ctrl
+        set pathway choice
+        set b-waste-type [waste-type] of prod
+        set b-tonnes tonnes
+        set avoided-cost legal-cost - cost
+        set detected? false
+        set detected-month -1
+        set detected-by ""
+        set new-batch self
+      ]
+      ask comp [
+        set costs costs + cost
+        set illegal-tonnes-co illegal-tonnes-co + tonnes
+        set open-batches lput new-batch open-batches
+      ]
+      ask ctrl [
+        set illegal-tonnes-c illegal-tonnes-c + tonnes
+        if not member? choice used-pathways [ set used-pathways lput choice used-pathways ]
+      ]
+      table:put month-illegal [who] of comp ((table:get-or-default month-illegal [who] of comp 0) + tonnes)
+      set month-batches lput new-batch month-batches
+      count-up "illegal_batches" 1
+      count-up "illegal_tonnes" tonnes
+      count-up "avoided_cost" (legal-cost - cost)
+      count-up (word "illegal_tonnes_pathway_" choice) tonnes
+      count-up (word "illegal_tonnes_type_" waste-type) tonnes
+      count-up (word "illegal_tonnes_ctype_" [ctype] of ctrl) tonnes
+    ]
+  ]
+
+  ask companies with [active?] [
+    set recent lput (list (table:get-or-default month-tonnes who 0)
+                          (table:get-or-default month-illegal who 0)) recent
+    if length recent > 12 [ set recent but-first recent ]
+  ]
+  set market-recent lput (list (table:get-or-default counters "tonnes" 0)
+                               (table:get-or-default counters "illegal_tonnes" 0)) market-recent
+  if length market-recent > 12 [ set market-recent but-first market-recent ]
+end
+
+to-report pathway-utility [name ctrl legal-cost pressure]
+  ;; U = reward + propensity - effort - risk (+ pressure) for one illegal option.
+  ;; Money terms are shares of the legal cost of the consignment, so that reward
+  ;; and risk share a scale. With the weights at 1 and pressure weight 0 this is
+  ;; exactly the research group's formula.
+  let i position name pathway-names
+  let risk ([item i perceived-detection] of ctrl)
+           * (param "legal_chain.sanction_probability") * (param "legal_chain.fine_sek") / legal-cost
+  report (param "decision.weight_reward") * (1 - pathway-param name "cost_share")
+         + [propensity] of ctrl
+         - (param "decision.weight_effort") * (pathway-param name "effort")
+         - (param "decision.weight_risk") * risk
+         + (param "decision.weight_pressure") * pressure
+end
+
+to-report choice-probabilities [utilities]
+  ;; Turns U for each illegal option into probabilities. Legal handling is the
+  ;; reference with U = 0. With one illegal option this is P = 1 / (1 + e^(-U)).
+  ;; Reports a list aligned with pathway-names, plus the legal probability last.
+  let highest max (fput 0 utilities)
+  let weights map [ u -> exp (u - highest) ] utilities
+  let legal-weight exp (0 - highest)
+  let total legal-weight + sum weights
+  report lput (legal-weight / total) (map [ w -> w / total ] weights)
+end
+
+to-report pick-choice [probabilities]
+  ;; Draw one option: the pathways in order, then legal.
+  let draw random-float 1
+  let cumulative 0
+  foreach (range length pathway-names) [ i ->
+    set cumulative cumulative + item i probabilities
+    if draw < cumulative [ report item i pathway-names ]
+  ]
+  report "legal"
+end
+
+;; 4. Roadside checks ----------------------------------------------------------
+
+to road-checks
+  let p-check param "road_checks.check_probability_per_transport"
+  ;; Checks are random among all transports. A legal transport gives no finding,
+  ;; so for those only the number of checks (the resource use) is counted.
+  let n-legal (count producers) - (length month-batches)
+  let n-checked 0
+  repeat n-legal [ if random-float 1 < p-check [ set n-checked n-checked + 1 ] ]
+  count-up "road_checks" n-checked
+  foreach month-batches [ b ->
+    if random-float 1 < p-check [
+      count-up "road_checks" 1
+      let comp [b-company] of b
+      ;; A firm already closed this month gets no further findings.
+      if [active?] of comp and random-float 1 < pathway-param ([pathway] of b) "detection.road_check" [
+        detect comp (list b) "road_check"
+      ]
+    ]
+  ]
+end
+
+;; 5. The public ---------------------------------------------------------------
+
+to public-reports
+  let report-p param "public.report_probability_per_dumped_batch"
+  let attribution-p param "public.attribution_probability"
+  foreach month-batches [ b ->
+    if pathway-param ([pathway] of b) "publicly_visible" [
+      if random-float 1 < report-p [
+        count-up "reports_private" 1
+        ;; Usually the report cannot be tied to a firm and is written off.
+        if random-float 1 < attribution-p [
+          count-up "reports_private_with_suspect" 1
+          let comp [b-company] of b
+          ask one-of regulators with [r-municipality = [municipality] of comp] [
+            table:put complaints [who] of comp ((table:get-or-default complaints [who] of comp 0) + 1)
+          ]
+        ]
+      ]
+    ]
+  ]
+end
+
+;; 6. Supervision --------------------------------------------------------------
+
+to supervise
+  let rate param "supervision.inspections_per_company_year"
+  let risk-weight param "supervision.risk_weight"
+  ask regulators [
+    let local sort-on [who] (companies with [active? and municipality = [r-municipality] of myself])
+    if not empty? local [
+      ;; Limited resources: this many inspections fit the budget.
+      set budget budget + capacity-factor * rate * (length local) / 12
+      let n min (list (floor budget) (length local))
+      if n > 0 [
+        set budget budget - n
+        ;; Complaints go first (event-driven supervision).
+        let reg self
+        let complained filter [ c -> (table:get-or-default complaints [who] of c 0) > 0 ] local
+        let targets sublist complained 0 (min (list n (length complained)))
+        ;; The rest are drawn by lot; firms with a high risk score are more likely (planned supervision).
+        let rest filter [ c -> not member? c targets ] local
+        let k min (list (n - length targets) (length rest))
+        if k > 0 [
+          set targets sentence targets (rnd:weighted-n-of-list k rest [ c -> 1 + risk-weight * (risk-score reg c) ])
+        ]
+        foreach targets [ c -> inspect-company c ]
+      ]
+    ]
+  ]
+end
+
+to-report risk-score [reg comp]
+  ;; What the authority knows about the firm when choosing whom to inspect.
+  let own table:get-or-default ([known-detections] of reg) ([who] of comp) 0
+  let score own + table:get-or-default ([complaints] of reg) ([who] of comp) 0
+  if (param "supervision.information_sharing") and not [frontman?] of comp [
+    ;; With information sharing, findings in the decision-maker's other firms are
+    ;; visible, and whether the person is in a criminal or intelligence register.
+    ;; A front man hides the connection.
+    let ctrl [my-controller] of comp
+    set score score + max (list 0 ([visible-detections] of ctrl - own))
+    if ctype-param ([ctype] of ctrl) "known_record" [ set score score + 1 ]
+  ]
+  report score
+end
+
+to inspect-company [comp]
+  ;; regulator context
+  count-up "inspections" 1
+  let kind ifelse-value (random-float 1 < param "supervision.on_site_share") ["on_site"] ["document"]
+  table:remove complaints [who] of comp
+  ;; The inspection looks back a certain number of months.
+  let cutoff month - param "supervision.lookback_months"
+  ask comp [
+    set open-batches filter [ b -> [b-month] of b > cutoff and not [detected?] of b ] open-batches
+  ]
+  let used remove-duplicates map [ b -> [pathway] of b ] ([open-batches] of comp)
+  set used filter [ name -> member? name used ] pathway-names     ; same order as the pathway list
+  let found filter [ name -> random-float 1 < pathway-param name (word "detection." kind) ] used
+  if not empty? found [
+    detect comp (filter [ b -> member? ([pathway] of b) found ] ([open-batches] of comp)) "supervision"
+  ]
+end
+
+;; Detection and its consequences ---------------------------------------------
+
+to detect [comp batch-list source]
+  let own-rate param "decision.learning_rate_own"
+  let vicarious-rate param "decision.learning_rate_vicarious"
+  let ctrl [my-controller] of comp
+  let found remove-duplicates map [ b -> [pathway] of b ] batch-list
+  foreach batch-list [ b ->
+    ask b [ set detected? true  set detected-month month  set detected-by source ]
+  ]
+  ;; The finding is registered with the municipality's supervisory authority.
+  ask comp [ set detections detections + 1 ]
+  ask one-of regulators with [r-municipality = [municipality] of comp] [
+    table:put known-detections [who] of comp ((table:get-or-default known-detections [who] of comp 0) + 1)
+  ]
+  if not [frontman?] of comp [ ask ctrl [ set visible-detections visible-detections + 1 ] ]
+  count-up "detections" 1
+  count-up (word "detections_by_" source) 1
+  count-up (word "detections_ctype_" [ctype] of ctrl) 1
+
+  ;; Duty to report: suspected crime is reported to police or prosecutor.
+  set reports lput (list (month + param "legal_chain.processing_months") comp) reports
+  count-up "reports_authority" 1
+
+  ;; Learning: whoever is caught perceives the risk as higher ...
+  ask ctrl [
+    foreach found [ name ->
+      let i position name pathway-names
+      set perceived-detection replace-item i perceived-detection
+          ((item i perceived-detection) + own-rate * (1 - item i perceived-detection))
+      if not member? name detected-pathways [ set detected-pathways lput name detected-pathways ]
+    ]
+  ]
+  ;; ... and so do other decision-makers in the same municipality, but less.
+  ;; (Counted once per other active firm, as in the Python model.)
+  ask companies with [active? and municipality = [municipality] of comp and my-controller != ctrl] [
+    ask my-controller [
+      foreach found [ name ->
+        let i position name pathway-names
+        set perceived-detection replace-item i perceived-detection
+            ((item i perceived-detection) + vicarious-rate * (1 - item i perceived-detection))
+      ]
+    ]
+  ]
+
+  ;; Consequences for the firm: all arrangements are revisited; a ban after
+  ;; repeated findings, otherwise possibly a firm switch.
+  ask producers with [my-company = comp] [ set handling "" ]
+  if [active?] of comp [
+    ifelse [detections] of comp >= param "supervision.detections_before_prohibition" [
+      close-company comp "prohibition"
+    ] [
+      if [can-switch?] of ctrl and random-float 1 < param "adaptation.switch_probability_after_detection" [
+        close-company comp "switched"
+      ]
+    ]
+  ]
+end
+
+to close-company [comp reason]
+  ask comp [ set active? false  set closed-month month  set close-reason reason ]
+  count-up (word "closures_" reason) 1
+  let former sort-on [who] (producers with [my-company = comp])
+  ask producers with [my-company = comp] [ set my-company nobody  set handling "" ]
+  let ctrl [my-controller] of comp
+  let due month + param "adaptation.restart_delay_months"
+  ifelse [can-switch?] of ctrl [
+    ;; The decision-maker obtains a new firm (through a company broker).
+    set pending lput (list due ctrl ([municipality] of comp) former) pending
+  ] [
+    ;; The decision-maker leaves the market. A new actor takes the place.
+    if not any? (turtle-set [company-list] of ctrl) with [active?] [ ask ctrl [ set active-c? false ] ]
+    set pending lput (list due nobody ([municipality] of comp) []) pending
+  ]
+end
+
+;; 7. The justice chain ----------------------------------------------------------
+
+to legal-chain
+  let sanction-p param "legal_chain.sanction_probability"
+  let fine param "legal_chain.fine_sek"
+  let due filter [ r -> item 0 r <= month ] reports
+  set reports filter [ r -> item 0 r > month ] reports
+  foreach due [ r ->
+    count-up "reports_decided" 1
+    if random-float 1 < sanction-p [
+      count-up "sanctions" 1
+      let comp item 1 r
+      ifelse [active?] of comp [
+        ask comp [ set fines fines + fine ]
+        count-up "fines_collected" fine
+      ] [
+        ;; The firm no longer exists: the fine cannot be collected.
+        count-up "fines_uncollectable" fine
+      ]
+    ]
+  ]
+end
+
+;; 8. Learning -------------------------------------------------------------------
+
+to learn
+  ;; Whoever used an illegal method without being caught perceives the risk as lower.
+  let rate param "decision.learning_rate_own"
+  ask controllers [
+    foreach used-pathways [ name ->
+      if not member? name detected-pathways [
+        let i position name pathway-names
+        set perceived-detection replace-item i perceived-detection
+            ((item i perceived-detection) - rate * (item i perceived-detection))
+      ]
+    ]
+    set used-pathways []
+    set detected-pathways []
+  ]
+end
+
+;; 9. Measurement ------------------------------------------------------------------
+
+to record-month
+  let tonnes table:get-or-default counters "tonnes" 0
+  let illegal table:get-or-default counters "illegal_tonnes" 0
+  set series-illegal-share lput (ifelse-value (tonnes > 0) [illegal / tonnes] [0]) series-illegal-share
+  if month >= intervention-month [
+    foreach table:keys counters [ key ->
+      table:put totals key ((table:get-or-default totals key 0) + table:get counters key)
+    ]
+  ]
+  if month = n-months [
+    let active-ctrls turtle-set [my-controller] of companies with [active?]
+    set end-perceived map [ name -> mean [item (position name pathway-names) perceived-detection] of active-ctrls ] pathway-names
+  ]
+end
+
+;; -----------------------------------------------------------------------------
+;; Metrics over the measurement period, defined as in the Python model's outputs.py
+;; -----------------------------------------------------------------------------
+
+to-report total-of [key]
+  report table:get-or-default totals key 0
+end
+
+to-report measured-years
+  report (n-months - intervention-month + 1) / 12
+end
+
+to-report share-of [numerator denominator]
+  report ifelse-value (denominator > 0) [numerator / denominator] ["NaN"]
+end
+
+to-report illegal-share                 report share-of (total-of "illegal_tonnes") (total-of "tonnes") end
+to-report illegal-batches-per-year      report (total-of "illegal_batches") / measured-years end
+to-report avoided-cost-per-year-msek    report (total-of "avoided_cost") / measured-years / 1e6 end
+to-report fines-total                   report (total-of "fines_collected") + (total-of "fines_uncollectable") end
+to-report fines-per-year-msek           report fines-total / measured-years / 1e6 end
+to-report fines-to-gain                 report share-of fines-total (total-of "avoided_cost") end
+to-report fines-uncollectable-share     report share-of (total-of "fines_uncollectable") fines-total end
+to-report inspections-per-year          report (total-of "inspections") / measured-years end
+to-report road-checks-per-year          report (total-of "road_checks") / measured-years end
+to-report hit-rate                      report share-of (total-of "detections_by_supervision") (total-of "inspections") end
+to-report detections-per-year           report (total-of "detections") / measured-years end
+to-report reports-private-per-year      report (total-of "reports_private") / measured-years end
+to-report sanctions-per-year            report (total-of "sanctions") / measured-years end
+to-report prohibitions-per-year         report (total-of "closures_prohibition") / measured-years end
+to-report company-switches-per-year     report (total-of "closures_switched") / measured-years end
+
+to-report pathway-share-of-illegal [name]
+  report share-of (total-of (word "illegal_tonnes_pathway_" name)) (total-of "illegal_tonnes")
+end
+
+to-report share-of-illegal-ctype [name]
+  report share-of (total-of (word "illegal_tonnes_ctype_" name)) (total-of "illegal_tonnes")
+end
+
+to-report share-of-detections-ctype [name]
+  report share-of (total-of (word "detections_ctype_" name)) (total-of "detections")
+end
+
+to-report perceived-detection-end [name]
+  report item (position name pathway-names) end-perceived
+end
+
+to-report detected-share
+  ;; Dark figure. Batches from the last months have not had time to be inspected
+  ;; and are therefore left out.
+  let last-month n-months - param "supervision.lookback_months"
+  let measured batches with [b-month >= intervention-month and b-month <= last-month]
+  report share-of (sum [b-tonnes] of measured with [detected?]) (sum [b-tonnes] of measured)
+end
+
+to-report top5pct-share-of-illegal
+  ;; Concentration: how much of the illegal waste a few decision-makers account for.
+  let per-controller table:make
+  ask batches with [b-month >= intervention-month] [
+    table:put per-controller [who] of b-controller
+        ((table:get-or-default per-controller [who] of b-controller 0) + b-tonnes)
+  ]
+  let n-top max (list 1 (ceiling (0.05 * count controllers)))
+  let sorted-values sort-by > table:values per-controller
+  report share-of (sum sublist sorted-values 0 (min (list n-top (length sorted-values))))
+                  (total-of "illegal_tonnes")
+end
+
+to-report max-companies-per-controller
+  report max [length company-list] of controllers
+end
+
+to-report illegal-share-this-month
+  report ifelse-value (empty? series-illegal-share) [0] [last series-illegal-share]
+end]]></code>
+  <widgets>
+    <view x="420" wrappingAllowedX="true" y="10" frameRate="30.0" minPycor="-5" height="132" showTickCounter="true" patchSize="12.0" fontSize="10" wrappingAllowedY="true" width="132" tickCounterLabel="month" maxPycor="5" updateMode="1" maxPxcor="5" minPxcor="-5"></view>
+    <chooser x="10" y="10" height="45" variable="scenario-name" current="0" display="scenario-name" width="250">
+      <choice type="string" value="baseline"></choice>
+      <choice type="string" value="fler_kontroller"></choice>
+      <choice type="string" value="riskbaserad_tillsyn"></choice>
+      <choice type="string" value="kontroller_pa_plats"></choice>
+      <choice type="string" value="hogre_sanktioner"></choice>
+      <choice type="string" value="informationsdelning"></choice>
+      <choice type="string" value="vagkontroller"></choice>
+      <choice type="string" value="kombinerad"></choice>
+    </chooser>
+    <input x="270" multiline="false" y="10" height="45" variable="run-seed" type="number" width="130">1</input>
+    <button x="10" y="65" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="80" display="setup">setup</button>
+    <button x="100" y="65" height="40" disableUntilTicks="true" forever="true" kind="Observer" width="80" display="go">go</button>
+    <button x="190" y="65" height="40" disableUntilTicks="true" forever="false" kind="Observer" width="120" display="run to end">run-to-end</button>
+    <monitor x="10" precision="0" y="115" height="45" fontSize="11" width="80" display="month">month</monitor>
+    <monitor x="100" precision="3" y="115" height="45" fontSize="11" width="150" display="illegal share, this month">illegal-share-this-month</monitor>
+    <monitor x="260" precision="0" y="115" height="45" fontSize="11" width="140" display="active firms">count companies with [active?]</monitor>
+    <plot x="10" y="170" height="200" width="390" display="Share of waste handled illegally" xAxis="month" yAxis="share" xMin="0.0" xMax="120.0" yMin="0.0" yMax="0.15" autoPlotX="true" autoPlotY="true" legend="false">
+      <setup></setup>
+      <update></update>
+      <pen display="illegal share" interval="1.0" mode="0" color="-16777216" legend="true">
+        <setup></setup>
+        <update>plot illegal-share-this-month</update>
+      </pen>
+    </plot>
+  </widgets>
+  <info><![CDATA[## WHAT IS IT?
+
+A NetLogo port of a Python prototype: an agent-based model of organised waste crime in Sweden, built for an international research group. See README.md and PROJECT_LOG.md in the repository for the model description, the evidence base and the labelling of every parameter value.
+
+The model is not calibrated and not validated. Results are outcomes under stated assumptions, not estimates of reality.
+
+## HOW TO USE IT
+
+Choose a scenario and a random seed, press setup, then go (or "run to end"). Parameters are read from data/parameters.csv and scenarios from data/scenarios.csv, both generated from the Python project's configuration files. To change a value, edit the CSV (or the YAML in the Python project and re-export).
+
+The BehaviorSpace experiment "regression" runs every scenario with seeds 1 to 30 and reports the same metrics as the Python model, for comparison.
+]]></info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup
+repeat 12 [ go ]</previewCommands>
+  <experiments>
+    <experiment name="smoke" repetitions="1" sequentialRunOrder="true" runMetricsEveryStep="false" timeLimit="0">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>illegal-share</metric>
+        <metric>illegal-batches-per-year</metric>
+        <metric>avoided-cost-per-year-msek</metric>
+        <metric>fines-per-year-msek</metric>
+        <metric>fines-to-gain</metric>
+        <metric>fines-uncollectable-share</metric>
+        <metric>inspections-per-year</metric>
+        <metric>road-checks-per-year</metric>
+        <metric>hit-rate</metric>
+        <metric>detections-per-year</metric>
+        <metric>reports-private-per-year</metric>
+        <metric>sanctions-per-year</metric>
+        <metric>prohibitions-per-year</metric>
+        <metric>company-switches-per-year</metric>
+        <metric>detected-share</metric>
+        <metric>top5pct-share-of-illegal</metric>
+        <metric>max-companies-per-controller</metric>
+        <metric>pathway-share-of-illegal "dumping"</metric>
+        <metric>pathway-share-of-illegal "misclassification"</metric>
+        <metric>perceived-detection-end "dumping"</metric>
+        <metric>perceived-detection-end "misclassification"</metric>
+        <metric>share-of-illegal-ctype "ordinary"</metric>
+        <metric>share-of-illegal-ctype "prior_record"</metric>
+        <metric>share-of-illegal-ctype "oc_linked"</metric>
+        <metric>share-of-detections-ctype "ordinary"</metric>
+        <metric>share-of-detections-ctype "prior_record"</metric>
+        <metric>share-of-detections-ctype "oc_linked"</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="run-seed">
+          <value value="1"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="scenario-name">
+          <value value="&quot;baseline&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="regression" repetitions="1" sequentialRunOrder="true" runMetricsEveryStep="false" timeLimit="0">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>illegal-share</metric>
+        <metric>illegal-batches-per-year</metric>
+        <metric>avoided-cost-per-year-msek</metric>
+        <metric>fines-per-year-msek</metric>
+        <metric>fines-to-gain</metric>
+        <metric>fines-uncollectable-share</metric>
+        <metric>inspections-per-year</metric>
+        <metric>road-checks-per-year</metric>
+        <metric>hit-rate</metric>
+        <metric>detections-per-year</metric>
+        <metric>reports-private-per-year</metric>
+        <metric>sanctions-per-year</metric>
+        <metric>prohibitions-per-year</metric>
+        <metric>company-switches-per-year</metric>
+        <metric>detected-share</metric>
+        <metric>top5pct-share-of-illegal</metric>
+        <metric>max-companies-per-controller</metric>
+        <metric>pathway-share-of-illegal "dumping"</metric>
+        <metric>pathway-share-of-illegal "misclassification"</metric>
+        <metric>perceived-detection-end "dumping"</metric>
+        <metric>perceived-detection-end "misclassification"</metric>
+        <metric>share-of-illegal-ctype "ordinary"</metric>
+        <metric>share-of-illegal-ctype "prior_record"</metric>
+        <metric>share-of-illegal-ctype "oc_linked"</metric>
+        <metric>share-of-detections-ctype "ordinary"</metric>
+        <metric>share-of-detections-ctype "prior_record"</metric>
+        <metric>share-of-detections-ctype "oc_linked"</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="run-seed">
+          <value value="1"></value>
+          <value value="2"></value>
+          <value value="3"></value>
+          <value value="4"></value>
+          <value value="5"></value>
+          <value value="6"></value>
+          <value value="7"></value>
+          <value value="8"></value>
+          <value value="9"></value>
+          <value value="10"></value>
+          <value value="11"></value>
+          <value value="12"></value>
+          <value value="13"></value>
+          <value value="14"></value>
+          <value value="15"></value>
+          <value value="16"></value>
+          <value value="17"></value>
+          <value value="18"></value>
+          <value value="19"></value>
+          <value value="20"></value>
+          <value value="21"></value>
+          <value value="22"></value>
+          <value value="23"></value>
+          <value value="24"></value>
+          <value value="25"></value>
+          <value value="26"></value>
+          <value value="27"></value>
+          <value value="28"></value>
+          <value value="29"></value>
+          <value value="30"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="scenario-name">
+          <value value="&quot;baseline&quot;"></value>
+          <value value="&quot;fler_kontroller&quot;"></value>
+          <value value="&quot;riskbaserad_tillsyn&quot;"></value>
+          <value value="&quot;kontroller_pa_plats&quot;"></value>
+          <value value="&quot;hogre_sanktioner&quot;"></value>
+          <value value="&quot;informationsdelning&quot;"></value>
+          <value value="&quot;vagkontroller&quot;"></value>
+          <value value="&quot;kombinerad&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="timeseries" repetitions="1" sequentialRunOrder="true" runMetricsEveryStep="true" timeLimit="0">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>illegal-share</metric>
+        <metric>illegal-batches-per-year</metric>
+        <metric>avoided-cost-per-year-msek</metric>
+        <metric>fines-per-year-msek</metric>
+        <metric>fines-to-gain</metric>
+        <metric>fines-uncollectable-share</metric>
+        <metric>inspections-per-year</metric>
+        <metric>road-checks-per-year</metric>
+        <metric>hit-rate</metric>
+        <metric>detections-per-year</metric>
+        <metric>reports-private-per-year</metric>
+        <metric>sanctions-per-year</metric>
+        <metric>prohibitions-per-year</metric>
+        <metric>company-switches-per-year</metric>
+        <metric>detected-share</metric>
+        <metric>top5pct-share-of-illegal</metric>
+        <metric>max-companies-per-controller</metric>
+        <metric>pathway-share-of-illegal "dumping"</metric>
+        <metric>pathway-share-of-illegal "misclassification"</metric>
+        <metric>perceived-detection-end "dumping"</metric>
+        <metric>perceived-detection-end "misclassification"</metric>
+        <metric>share-of-illegal-ctype "ordinary"</metric>
+        <metric>share-of-illegal-ctype "prior_record"</metric>
+        <metric>share-of-illegal-ctype "oc_linked"</metric>
+        <metric>share-of-detections-ctype "ordinary"</metric>
+        <metric>share-of-detections-ctype "prior_record"</metric>
+        <metric>share-of-detections-ctype "oc_linked"</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="run-seed">
+          <value value="1"></value>
+          <value value="2"></value>
+          <value value="3"></value>
+          <value value="4"></value>
+          <value value="5"></value>
+          <value value="6"></value>
+          <value value="7"></value>
+          <value value="8"></value>
+          <value value="9"></value>
+          <value value="10"></value>
+          <value value="11"></value>
+          <value value="12"></value>
+          <value value="13"></value>
+          <value value="14"></value>
+          <value value="15"></value>
+          <value value="16"></value>
+          <value value="17"></value>
+          <value value="18"></value>
+          <value value="19"></value>
+          <value value="20"></value>
+          <value value="21"></value>
+          <value value="22"></value>
+          <value value="23"></value>
+          <value value="24"></value>
+          <value value="25"></value>
+          <value value="26"></value>
+          <value value="27"></value>
+          <value value="28"></value>
+          <value value="29"></value>
+          <value value="30"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="scenario-name">
+          <value value="&quot;baseline&quot;"></value>
+          <value value="&quot;fler_kontroller&quot;"></value>
+          <value value="&quot;riskbaserad_tillsyn&quot;"></value>
+          <value value="&quot;kontroller_pa_plats&quot;"></value>
+          <value value="&quot;hogre_sanktioner&quot;"></value>
+          <value value="&quot;informationsdelning&quot;"></value>
+          <value value="&quot;vagkontroller&quot;"></value>
+          <value value="&quot;kombinerad&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="deep-check" repetitions="1" sequentialRunOrder="true" runMetricsEveryStep="false" timeLimit="0">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>illegal-share</metric>
+        <metric>illegal-batches-per-year</metric>
+        <metric>avoided-cost-per-year-msek</metric>
+        <metric>fines-per-year-msek</metric>
+        <metric>fines-to-gain</metric>
+        <metric>fines-uncollectable-share</metric>
+        <metric>inspections-per-year</metric>
+        <metric>road-checks-per-year</metric>
+        <metric>hit-rate</metric>
+        <metric>detections-per-year</metric>
+        <metric>reports-private-per-year</metric>
+        <metric>sanctions-per-year</metric>
+        <metric>prohibitions-per-year</metric>
+        <metric>company-switches-per-year</metric>
+        <metric>detected-share</metric>
+        <metric>top5pct-share-of-illegal</metric>
+        <metric>max-companies-per-controller</metric>
+        <metric>pathway-share-of-illegal "dumping"</metric>
+        <metric>pathway-share-of-illegal "misclassification"</metric>
+        <metric>perceived-detection-end "dumping"</metric>
+        <metric>perceived-detection-end "misclassification"</metric>
+        <metric>share-of-illegal-ctype "ordinary"</metric>
+        <metric>share-of-illegal-ctype "prior_record"</metric>
+        <metric>share-of-illegal-ctype "oc_linked"</metric>
+        <metric>share-of-detections-ctype "ordinary"</metric>
+        <metric>share-of-detections-ctype "prior_record"</metric>
+        <metric>share-of-detections-ctype "oc_linked"</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="run-seed">
+          <value value="1"></value>
+          <value value="2"></value>
+          <value value="3"></value>
+          <value value="4"></value>
+          <value value="5"></value>
+          <value value="6"></value>
+          <value value="7"></value>
+          <value value="8"></value>
+          <value value="9"></value>
+          <value value="10"></value>
+          <value value="11"></value>
+          <value value="12"></value>
+          <value value="13"></value>
+          <value value="14"></value>
+          <value value="15"></value>
+          <value value="16"></value>
+          <value value="17"></value>
+          <value value="18"></value>
+          <value value="19"></value>
+          <value value="20"></value>
+          <value value="21"></value>
+          <value value="22"></value>
+          <value value="23"></value>
+          <value value="24"></value>
+          <value value="25"></value>
+          <value value="26"></value>
+          <value value="27"></value>
+          <value value="28"></value>
+          <value value="29"></value>
+          <value value="30"></value>
+          <value value="31"></value>
+          <value value="32"></value>
+          <value value="33"></value>
+          <value value="34"></value>
+          <value value="35"></value>
+          <value value="36"></value>
+          <value value="37"></value>
+          <value value="38"></value>
+          <value value="39"></value>
+          <value value="40"></value>
+          <value value="41"></value>
+          <value value="42"></value>
+          <value value="43"></value>
+          <value value="44"></value>
+          <value value="45"></value>
+          <value value="46"></value>
+          <value value="47"></value>
+          <value value="48"></value>
+          <value value="49"></value>
+          <value value="50"></value>
+          <value value="51"></value>
+          <value value="52"></value>
+          <value value="53"></value>
+          <value value="54"></value>
+          <value value="55"></value>
+          <value value="56"></value>
+          <value value="57"></value>
+          <value value="58"></value>
+          <value value="59"></value>
+          <value value="60"></value>
+          <value value="61"></value>
+          <value value="62"></value>
+          <value value="63"></value>
+          <value value="64"></value>
+          <value value="65"></value>
+          <value value="66"></value>
+          <value value="67"></value>
+          <value value="68"></value>
+          <value value="69"></value>
+          <value value="70"></value>
+          <value value="71"></value>
+          <value value="72"></value>
+          <value value="73"></value>
+          <value value="74"></value>
+          <value value="75"></value>
+          <value value="76"></value>
+          <value value="77"></value>
+          <value value="78"></value>
+          <value value="79"></value>
+          <value value="80"></value>
+          <value value="81"></value>
+          <value value="82"></value>
+          <value value="83"></value>
+          <value value="84"></value>
+          <value value="85"></value>
+          <value value="86"></value>
+          <value value="87"></value>
+          <value value="88"></value>
+          <value value="89"></value>
+          <value value="90"></value>
+          <value value="91"></value>
+          <value value="92"></value>
+          <value value="93"></value>
+          <value value="94"></value>
+          <value value="95"></value>
+          <value value="96"></value>
+          <value value="97"></value>
+          <value value="98"></value>
+          <value value="99"></value>
+          <value value="100"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="scenario-name">
+          <value value="&quot;baseline&quot;"></value>
+          <value value="&quot;hogre_sanktioner&quot;"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+  </experiments>
+</model>

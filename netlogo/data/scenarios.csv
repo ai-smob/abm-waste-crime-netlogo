@@ -1,0 +1,11 @@
+scenario,key,type,value
+baseline,,,
+fler_kontroller,supervision.inspections_per_company_year,number,1.0
+riskbaserad_tillsyn,supervision.risk_weight,number,20.0
+kontroller_pa_plats,supervision.on_site_share,number,0.6
+hogre_sanktioner,legal_chain.fine_sek,number,560000
+informationsdelning,supervision.information_sharing,boolean,true
+vagkontroller,road_checks.check_probability_per_transport,number,0.01
+kombinerad,supervision.risk_weight,number,20.0
+kombinerad,supervision.information_sharing,boolean,true
+kombinerad,supervision.on_site_share,number,0.6

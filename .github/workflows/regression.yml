@@ -1,0 +1,56 @@
+name: Regression test against the Python model
+
+# On every push and pull request: run the NetLogo model headless over all
+# scenarios and seeds and compare the distributions of every metric with the
+# Python model's reference runs. Fails if any comparison differs.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  NETLOGO_VERSION: 7.0.4
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Cache NetLogo
+        id: cache-netlogo
+        uses: actions/cache@v4
+        with:
+          path: ~/netlogo
+          key: netlogo-${{ env.NETLOGO_VERSION }}-linux64
+
+      - name: Download NetLogo
+        if: steps.cache-netlogo.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/netlogo
+          curl -sSL -o ~/netlogo/netlogo.tgz \
+            "https://github.com/NetLogo/NetLogo/releases/download/v${NETLOGO_VERSION}/NetLogo-${NETLOGO_VERSION}-64.tgz"
+          tar -xzf ~/netlogo/netlogo.tgz -C ~/netlogo
+          rm ~/netlogo/netlogo.tgz
+
+      - name: Run the model and compare with Python
+        run: NETLOGO_HOME="$HOME/netlogo/NetLogo $NETLOGO_VERSION" bash tools/run_regression.sh 4
+
+      - name: Keep the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-results
+          path: netlogo/results/
