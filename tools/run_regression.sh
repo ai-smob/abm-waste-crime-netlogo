@@ -15,5 +15,16 @@ echo "Running BehaviorSpace experiment 'regression' with $THREADS threads ..."
     --model waste_crime.nlogox --experiment regression \
     --table results/netlogo_runs.csv --threads "$THREADS" 2>&1 | grep -v '^JAVA_HOME' || true )
 test -s netlogo/results/netlogo_runs.csv || { echo "No NetLogo output produced."; exit 1; }
-python3 tools/compare.py netlogo/results/netlogo_runs.csv reference/python_runs_v0.2.csv \
+# Python is "python3" on Linux and macOS and usually "python" on Windows, where "python3"
+# may be a Microsoft Store stub that only prints an error. Take the first that runs.
+# PYTHON=/path/to/python overrides.
+if [ -z "${PYTHON:-}" ]; then
+  for candidate in python3 python py; do
+    if "$candidate" -c "import sys" > /dev/null 2>&1; then PYTHON="$candidate"; break; fi
+  done
+fi
+test -n "${PYTHON:-}" || { echo "No working Python found on the PATH. Set PYTHON=/path/to/python."; exit 1; }
+echo "Comparing with the Python reference runs ..."
+"$PYTHON" tools/compare.py netlogo/results/netlogo_runs.csv reference/python_runs_v0.2.csv \
     --out netlogo/results/comparison.md
+echo "Report: netlogo/results/comparison.md"
