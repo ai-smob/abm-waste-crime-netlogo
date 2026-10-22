@@ -3,7 +3,7 @@
 NetLogo runs: `netlogo\results\deep_netlogo.csv`. Python runs: `netlogo\results\deep_py\korningar.csv`.
 Verdict rule: agree when |difference of means| <= 3 x its standard error. Seeds are not comparable between the implementations (different random number generators), so only distributions are compared.
 
-**Result: 61 of 61 comparisons agree, 0 differ.**
+**PASS: 61 of 61 comparisons agree, 0 differ (z > 3); 0 with z > 4.5.** The run fails if any z > 4.5 or more than 2 % differ.
 
 ## baseline: levels
 

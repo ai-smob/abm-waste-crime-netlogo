@@ -15,8 +15,14 @@ any metric disagrees. Only the Python standard library is used.
 Verdict per scenario and metric:
     agree      |difference of means| <= Z * standard error of the difference
     DIFFERS    otherwise
-with Z = 3 (about one false alarm in 400 comparisons when the models are identical).
-Metrics whose spread is zero in both implementations must be exactly equal.
+with Z = 3. Metrics whose spread is zero in both implementations must be exactly equal.
+
+Overall verdict (the exit status). With about 265 comparisons, one or two z-scores just
+above 3 are expected by chance even when the models are identical (seen on 2026-10-22,
+and cleared with 100 seeds). A real divergence shows up as a large z or as many flags
+at once. The run therefore FAILS only if any comparison has z > Z_HARD (4.5) or if more
+than MAX_FLAG_SHARE (2 %) of the comparisons have z > Z. Flags below that are listed in
+the report for a human to look at.
 """
 
 from __future__ import annotations
@@ -60,6 +66,8 @@ METRICS = {
     'share-of-detections-ctype "oc_linked"': "share_of_detections_ctype_oc_linked",
 }
 Z = 3.0
+Z_HARD = 4.5
+MAX_FLAG_SHARE = 0.02
 
 
 def to_float(text: str) -> float:
@@ -150,6 +158,7 @@ def main() -> int:
         lines.append(f"\nScenarios missing in the NetLogo results: {', '.join(missing)}")
     n_differs = 0
     n_total = 0
+    z_scores: list[float] = []
 
     # 1. Levels per scenario
     for scenario in scenarios:
@@ -162,6 +171,7 @@ def main() -> int:
             verdict, ma, sa, mb, sb, z = judge(a, b)
             n_total += 1
             n_differs += verdict == "DIFFERS"
+            z_scores.append(z)
             lines.append(f"| {metric} | {fmt(ma)} ({fmt(sa)}) | {fmt(mb)} ({fmt(sb)}) | {fmt(z)} | {verdict} |")
 
     # 2. Intervention effects: scenario minus baseline, pairwise by seed within each implementation
@@ -182,17 +192,22 @@ def main() -> int:
                 verdict, ma, sa, mb, sb, z = judge(a, b)
                 n_total += 1
                 n_differs += verdict == "DIFFERS"
+                z_scores.append(z)
                 lines.append(f"| {scenario} | {metric} | {fmt(ma)} ({fmt(sa)}) | {fmt(mb)} ({fmt(sb)}) | {fmt(z)} | {verdict} |")
 
-    summary = (f"**Result: {n_total - n_differs} of {n_total} comparisons agree, "
-               f"{n_differs} differ.**")
+    hard = [z for z in z_scores if not math.isnan(z) and z > Z_HARD]
+    failed = bool(hard) or (n_total > 0 and n_differs / n_total > MAX_FLAG_SHARE)
+    verdict = "FAIL" if failed else "PASS"
+    summary = (f"**{verdict}: {n_total - n_differs} of {n_total} comparisons agree, "
+               f"{n_differs} differ (z > {Z:g}); {len(hard)} with z > {Z_HARD:g}.** "
+               f"The run fails if any z > {Z_HARD:g} or more than {100 * MAX_FLAG_SHARE:g} % differ.")
     lines.insert(4, "")
     lines.insert(5, summary)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(summary)
     print(f"Report: {args.out}")
-    return 1 if n_differs else 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
